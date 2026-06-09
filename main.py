@@ -10,11 +10,16 @@ logger = logging.getLogger("AttioSignals")
 # ---CONFIGURACION---
 ATTIO_API_KEY = os.getenv("ATTIO_API_KEY")
 LIST_SLUG = os.getenv("LIST_SLUG")
+LATAM_LIST_SLUG = "startups_deal_flow_2"
+MEXICO_STAGES = {"Mexico 2026", "Leads Mexico 2026"}
 BASE_URL = "https://api.attio.com/v2"
 HEADERS = {
     "Authorization": f"Bearer {ATTIO_API_KEY}",
     "Content-Type": "application/json"
 }
+
+def get_active_list(deal_stage: str) -> str:
+    return LATAM_LIST_SLUG if deal_stage in MEXICO_STAGES else LIST_SLUG
 
 # Constantes de índices (Tally) - Tus originales
 REVIEWER_INDEX = 0
@@ -42,7 +47,7 @@ async def find_company_id_from_domain(domain: str) -> str:
             logger.error(f"Error buscando compañía: {e}")
             return ""
 
-async def find_deal_from_company_id(company_id: str) -> str:
+async def find_deal_from_company_id(company_id: str) -> tuple:
     url = f"{BASE_URL}/objects/deals/records/query"
     payload = {
         "filter": {
@@ -58,16 +63,22 @@ async def find_deal_from_company_id(company_id: str) -> str:
             res = await client.post(url, headers=HEADERS, json=payload)
             res.raise_for_status()
             data = res.json().get("data", [])
-            return data[0].get("id", {}).get("record_id", "") if data else ""
+            if not data:
+                return "", ""
+            deal = data[0]
+            deal_id = deal.get("id", {}).get("record_id", "")
+            stage_list = deal.get("values", {}).get("stage", [])
+            deal_stage = stage_list[0].get("status", {}).get("title", "") if stage_list else ""
+            return deal_id, deal_stage
         except Exception as e:
             logger.error(f"Error buscando deal: {e}")
-            return ""
+            return "", ""
 
-async def find_entry_from_deal_id(deal_id: str):
-    url = f"{BASE_URL}/lists/{LIST_SLUG}/entries/query"
+async def find_entry_from_deal_id(deal_id: str, list_slug: str):
+    url = f"{BASE_URL}/lists/{list_slug}/entries/query"
     payload = {
         "filter": {
-            "path": [[LIST_SLUG, "parent_record"], ["deals", "record_id"]],
+            "path": [[list_slug, "parent_record"], ["deals", "record_id"]],
             "constraints": {"value": deal_id}
         },
         "limit": 1
@@ -178,8 +189,8 @@ def calculate_funnel_status(tier_actual, status_actual, t1_ok, t1_ko, t2_ok, t2_
 
     return default_status if default_status else "Qualified", True
 
-async def upload_reviewer_ko_ok(entry_id, es_voto_ok, reviewer, tier):
-    url = f"{BASE_URL}/lists/{LIST_SLUG}/entries/{entry_id}"
+async def upload_reviewer_ko_ok(entry_id, es_voto_ok, reviewer, tier, list_slug):
+    url = f"{BASE_URL}/lists/{list_slug}/entries/{entry_id}"
     field = ""
     if es_voto_ok is None:
         return
@@ -187,20 +198,20 @@ async def upload_reviewer_ko_ok(entry_id, es_voto_ok, reviewer, tier):
         field = "tier_1_ok" if es_voto_ok else "tier_1_ko"
     elif tier == "Tier 2":
         field = "tier_2_ok" if es_voto_ok else "tier_2_ko"
-    
+
     if not field: return
     data = {"data": {"entry_values": {field: [{"option": reviewer}]}}}
     async with httpx.AsyncClient(timeout=30.0) as client:
         await client.patch(url, headers=HEADERS, json=data)
 
-async def upload_senior_needed(entry_id):
-    url = f"{BASE_URL}/lists/{LIST_SLUG}/entries/{entry_id}"
+async def upload_senior_needed(entry_id, list_slug):
+    url = f"{BASE_URL}/lists/{list_slug}/entries/{entry_id}"
     data = {"data": {"entry_values": {"tier_5": [{"status": "Tier 2"}]}}}
     async with httpx.AsyncClient(timeout=30.0) as client:
         await client.patch(url, headers=HEADERS, json=data)
 
-async def upload_attio_entry(entry_id, payload, green, red, comments, status, veredicto_nombre, qualified=True):
-    url = f"{BASE_URL}/lists/{LIST_SLUG}/entries/{entry_id}"
+async def upload_attio_entry(entry_id, payload, green, red, comments, status, veredicto_nombre, list_slug, qualified=True):
+    url = f"{BASE_URL}/lists/{list_slug}/entries/{entry_id}"
     entry_values = {
         "signals_qualified": [{"value": payload}],
         "green_flags_qualified": [{"value": green}],
@@ -232,8 +243,9 @@ async def handle_signals(request: Request):
         domain = questions[DOMAIN_INDEX].get("value", "")
         
         company_id = await find_company_id_from_domain(domain)
-        deal_id = await find_deal_from_company_id(company_id)
-        entry_id, entry_values = await find_entry_from_deal_id(deal_id)
+        deal_id, deal_stage = await find_deal_from_company_id(company_id)
+        list_slug = get_active_list(deal_stage)
+        entry_id, entry_values = await find_entry_from_deal_id(deal_id, list_slug)
 
         if not entry_id:
             raise HTTPException(status_code=404, detail="Entry no encontrada")
@@ -245,7 +257,7 @@ async def handle_signals(request: Request):
 
         _, payload, green_flags, red_flags, new_comment, reviewer, veredicto_nombre, es_voto_ok = generar_payload(form_data, tier_actual)
         
-        await upload_reviewer_ko_ok(entry_id, es_voto_ok, reviewer, tier_actual)
+        await upload_reviewer_ko_ok(entry_id, es_voto_ok, reviewer, tier_actual, list_slug)
 
         t1_ok = len(entry_values.get("tier_1_ok", []))
         t1_ko = len(entry_values.get("tier_1_ko", []))
@@ -287,7 +299,7 @@ async def handle_signals(request: Request):
         status, qualified = calculate_funnel_status(tier_actual, status_actual, t1_ok, t1_ko, t2_ok, t2_ko, default_status)
 
         if tier_actual == "Tier 1" and t1_ok == 1 and t1_ko == 1:
-            await upload_senior_needed(entry_id)
+            await upload_senior_needed(entry_id, list_slug)
 
         new_conviction_line = f"{reviewer}: {veredicto_nombre}"
         ex_conviction_list = entry_values.get("screening_conviction", [])
@@ -295,7 +307,7 @@ async def handle_signals(request: Request):
 
         final_conviction = f"{new_conviction_line}\n---\n{ex_conviction}" if ex_conviction else new_conviction_line
 
-        await upload_attio_entry(entry_id, payload, green_flags, red_flags, final_comments, status, final_conviction, qualified)
+        await upload_attio_entry(entry_id, payload, green_flags, red_flags, final_comments, status, final_conviction, list_slug, qualified)
         
         if es_voto_ok is True:
             veredicto_webhook = "OK"
