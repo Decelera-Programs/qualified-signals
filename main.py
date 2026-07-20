@@ -2,6 +2,7 @@ from fastapi import FastAPI, Request, HTTPException
 import httpx
 import os
 import logging
+import random
 import uvicorn
 
 logging.basicConfig(level=logging.INFO)
@@ -20,6 +21,11 @@ HEADERS = {
 
 def get_active_list(deal_stage: str) -> str:
     return LATAM_LIST_SLUG if deal_stage in MEXICO_STAGES else LIST_SLUG
+
+# Pools de evaluadores
+TIER1_ANALYSTS = ["Diego", "Carlota", "Luiza"]
+TIER2_SENIORS  = ["Lorenzo", "Raquel"]
+CALL_EVALUATORS = ["Diego", "Carlota", "Lorenzo", "Raquel"]  # Luiza no está en las opciones de call_evaluator
 
 # Constantes de índices (Tally) - Tus originales
 REVIEWER_INDEX = 0
@@ -178,16 +184,18 @@ def generar_payload(form_data, tier_actual="Tier 1"):
     
     return domain, payload, green_txt, red_txt, comments, reviewer, veredicto_nombre, es_voto_ok
 
-def calculate_funnel_status(tier_actual, status_actual, t1_ok, t1_ko, t2_ok, t2_ko, default_status=None):
-    if tier_actual == "Tier 2" or (t1_ok >= 1 and t1_ko >= 1):
+def calculate_funnel_status(tier_actual, t1_ok, t1_ko, t2_ok, t2_ko, default_status=None):
+    if tier_actual == "Tier 2":
+        # Senior decide: un voto es suficiente
         if t2_ok >= 1: return "In play", True
         if t2_ko >= 1: return "Killed", False
-        return default_status, True
+        return default_status or "Qualified", True
 
-    if t1_ok >= 1: return "In play", True
-    if t1_ko >= 1: return "Killed", False
-
-    return default_status if default_status else "Qualified", True
+    # Tier 1: necesita unanimidad de 2 analistas
+    if t1_ok >= 2: return "In play", True
+    if t1_ko >= 2: return "Killed", False
+    # Empate (1-1) o pendiente (1-0 / 0-1): sin cambio hasta cerrar Tier 1
+    return default_status or "Qualified", True
 
 async def upload_reviewer_ko_ok(entry_id, es_voto_ok, reviewer, tier, list_slug):
     url = f"{BASE_URL}/lists/{list_slug}/entries/{entry_id}"
@@ -229,6 +237,96 @@ async def upload_attio_entry(entry_id, payload, green, red, comments, status, ve
     async with httpx.AsyncClient(timeout=30.0) as client:
         res = await client.patch(url, headers=HEADERS, json=data)
         res.raise_for_status()
+
+async def assign_pre_call_evaluators(entry_id: str, tier: str, list_slug: str):
+    if tier == "Tier 1":
+        selected = random.sample(TIER1_ANALYSTS, 2)
+    else:
+        selected = [random.choice(TIER2_SENIORS)]
+    url = f"{BASE_URL}/lists/{list_slug}/entries/{entry_id}"
+    data = {"data": {"entry_values": {
+        "pre_call_evaluator": [{"option": name} for name in selected]
+    }}}
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        await client.patch(url, headers=HEADERS, json=data)
+    logger.info(f"Pre-call evaluators asignados ({tier}): {selected}")
+
+async def assign_call_evaluator(entry_id: str, list_slug: str):
+    selected = random.choice(CALL_EVALUATORS)
+    url = f"{BASE_URL}/lists/{list_slug}/entries/{entry_id}"
+    data = {"data": {"entry_values": {
+        "call_evaluator": [{"option": selected}]
+    }}}
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        await client.patch(url, headers=HEADERS, json=data)
+    logger.info(f"Call evaluator asignado: {selected}")
+
+# --- TIERING AUTOMÁTICO DESDE SIGNALS (compañías sin form score) ---
+
+def has_form_score(entry_values: dict) -> bool:
+    values = entry_values.get("form_score", [])
+    return bool(values) and values[0].get("value") is not None
+
+def parse_latest_verdict_per_reviewer(conviction_text: str) -> dict:
+    latest = {}
+    for line in conviction_text.split("\n---\n"):
+        line = line.strip()
+        if ":" not in line:
+            continue
+        reviewer, _, verdict = line.partition(":")
+        reviewer = reviewer.strip()
+        verdict = verdict.strip()
+        if reviewer and reviewer not in latest:
+            latest[reviewer] = verdict
+    return latest
+
+def classify_verdict(verdict: str) -> str:
+    if "STRONG YES" in verdict: return "strong_yes"
+    if "WEAK YES" in verdict:   return "weak_yes"
+    if "STRONG NO" in verdict:  return "strong_no"
+    if "WEAK NO" in verdict:    return "weak_no"
+    if "INDEFINIDO" in verdict: return "indefinido"
+    return "unknown"
+
+def calculate_signals_tier(conviction_text: str):
+    """Devuelve ('tier', 'Tier 1'|'Tier 2'|'Tier 3'|'Review Flag'), ('kill', None) o (None, None)."""
+    latest = parse_latest_verdict_per_reviewer(conviction_text)
+    categories = [classify_verdict(v) for v in latest.values()]
+
+    has_yes = any(c in ("strong_yes", "weak_yes") for c in categories)
+    has_no = any(c in ("strong_no", "weak_no") for c in categories)
+
+    if has_yes and has_no:
+        return "tier", "Review Flag"
+
+    if has_no:
+        if any(c == "strong_no" for c in categories):
+            return "kill", None
+        return "tier", "Tier 3"  # solo WEAK NO
+
+    if has_yes:
+        yes_categories = [c for c in categories if c in ("strong_yes", "weak_yes")]
+        if all(c == "strong_yes" for c in yes_categories):
+            return "tier", "Tier 1"  # unanimidad en STRONG YES
+        return "tier", "Tier 2"  # mezcla o solo WEAK YES
+
+    if any(c == "indefinido" for c in categories):
+        return "tier", "Tier 3"
+
+    return None, None
+
+async def apply_signals_tier(entry_id: str, list_slug: str, action: str, tier_value: str):
+    url = f"{BASE_URL}/lists/{list_slug}/entries/{entry_id}"
+    if action == "kill":
+        data = {"data": {"entry_values": {
+            "status": [{"status": "Killed"}],
+            "reason": [{"status": "Screening conviction"}],
+        }}}
+    else:
+        data = {"data": {"entry_values": {"tier_5": [{"status": tier_value}]}}}
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        await client.patch(url, headers=HEADERS, json=data)
+    logger.info(f"Signals tiering: entry {entry_id} -> {action} {tier_value}")
 
 # --- WEBHOOK PRINCIPAL ---
 
@@ -296,10 +394,23 @@ async def handle_signals(request: Request):
 
         current_st_list = entry_values.get("status", [])
         default_status = current_st_list[0].get("status", {}).get("title", "") if current_st_list else ""
-        status, qualified = calculate_funnel_status(tier_actual, status_actual, t1_ok, t1_ko, t2_ok, t2_ko, default_status)
+        status, qualified = calculate_funnel_status(tier_actual, t1_ok, t1_ko, t2_ok, t2_ko, default_status)
 
+        pre_call_assigned = bool(entry_values.get("pre_call_evaluator", []))
+        call_eval_assigned = bool(entry_values.get("call_evaluator", []))
+
+        # Primera votación en Tier 1 → asignar 2 analistas al azar
+        if tier_actual == "Tier 1" and (t1_ok + t1_ko) == 1 and not pre_call_assigned:
+            await assign_pre_call_evaluators(entry_id, "Tier 1", list_slug)
+
+        # Empate en Tier 1 → escalar a Tier 2 y reasignar a un senior
         if tier_actual == "Tier 1" and t1_ok == 1 and t1_ko == 1:
             await upload_senior_needed(entry_id, list_slug)
+            await assign_pre_call_evaluators(entry_id, "Tier 2", list_slug)
+
+        # Deal llega a "In play" → asignar call evaluator al azar
+        if status == "In play" and not call_eval_assigned:
+            await assign_call_evaluator(entry_id, list_slug)
 
         new_conviction_line = f"{reviewer}: {veredicto_nombre}"
         ex_conviction_list = entry_values.get("screening_conviction", [])
@@ -308,7 +419,12 @@ async def handle_signals(request: Request):
         final_conviction = f"{new_conviction_line}\n---\n{ex_conviction}" if ex_conviction else new_conviction_line
 
         await upload_attio_entry(entry_id, payload, green_flags, red_flags, final_comments, status, final_conviction, list_slug, qualified)
-        
+
+        if not has_form_score(entry_values):
+            tier_action, tier_value = calculate_signals_tier(final_conviction)
+            if tier_action:
+                await apply_signals_tier(entry_id, list_slug, tier_action, tier_value)
+
         if es_voto_ok is True:
             veredicto_webhook = "OK"
         elif es_voto_ok is False:

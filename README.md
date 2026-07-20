@@ -47,6 +47,29 @@ El servidor queda en `http://0.0.0.0:8000` (o el puerto indicado en `PORT`). El 
 
 Con el servidor en marcha puedes abrir la documentación interactiva de FastAPI en `/docs`.
 
+## Tiering automático desde signals (compañías sin form score)
+
+Además de acumular el veredicto en `screening_conviction`, el webhook calcula automáticamente
+el campo **Tier** (`tier_5`) para compañías que **no** tienen `form_score` en Attio (es decir,
+que no llegaron por el formulario de founder application: referrals, intros de inversores,
+outbound). Si la entrada tiene `form_score`, esta capa no se ejecuta y todo se comporta como
+antes.
+
+El cálculo toma el **último veredicto de cada reviewer** (el historial acumulado en
+`screening_conviction`) y aplica:
+
+| Situación                                              | Resultado       |
+|---------------------------------------------------------|-----------------|
+| Unanimidad en 🔥 STRONG YES                              | Tier 1          |
+| Solo "yes" pero sin unanimidad en STRONG YES (mezcla con 🤢 WEAK YES) | Tier 2 |
+| Algún 🛑 STRONG NO (sin ningún "yes")                     | Killed (kill automático) |
+| Solo 🤔 WEAK NO (sin STRONG NO ni "yes")                  | Tier 3          |
+| Solo ❓ INDEFINIDO                                        | Tier 3          |
+| Mezcla real de "yes" y "no" entre reviewers distintos     | Review Flag     |
+
+El kill de esta capa usa `reason = "Screening conviction"`, igual que el resto del sistema.
+No pisa nunca el status en el caso de tier/Review Flag — solo escribe `tier_5`.
+
 ## Notas
 
 - El orden y número de preguntas del formulario deben coincidir con los índices definidos en `main.py` (`DOMAIN_INDEX`, `FLAGS_START`, etc.).
