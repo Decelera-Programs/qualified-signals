@@ -27,7 +27,9 @@ TIER1_ANALYSTS = ["Diego", "Carlota", "Luiza"]
 TIER2_SENIORS  = ["Lorenzo", "Raquel"]
 CALL_EVALUATORS = ["Diego", "Carlota", "Lorenzo", "Raquel"]  # Luiza no está en las opciones de call_evaluator
 
-# Constantes de índices (Tally) - Tus originales
+# Constantes de índices - layout ORIGINAL (sin la pregunta de stage)
+# Si el form incluye "Form Completion Stage" en la posición 2, todos los
+# índices a partir de FLAGS_START se desplazan +1 automáticamente.
 REVIEWER_INDEX = 0
 DOMAIN_INDEX = 1
 FLAGS_START = 2
@@ -36,7 +38,45 @@ MULTI_FLAGS_START = 9
 MULTI_FLAGS_END = 11
 COMMENTS_INDEX = 11
 
+# Nombre de la pregunta nueva en Fillout (case-insensitive)
+STAGE_QUESTION_NAME = "form completion stage"
+
 app = FastAPI()
+
+# ---DETECCION DE LAYOUT---
+
+def _question_label(q: dict) -> str:
+    """Fillout/Tally usan claves distintas para el enunciado."""
+    for key in ("name", "label", "title", "question"):
+        val = q.get(key)
+        if isinstance(val, str) and val.strip():
+            return val.strip()
+    return ""
+
+def detect_layout(questions: list) -> tuple:
+    """
+    Devuelve (shift, stage_value).
+    shift = 1 si el form incluye la pregunta de stage, 0 si es el form antiguo.
+    """
+    for i, q in enumerate(questions):
+        if _question_label(q).lower() == STAGE_QUESTION_NAME:
+            stage_val = q.get("value", "") or ""
+            if isinstance(stage_val, list):
+                stage_val = ", ".join(str(v) for v in stage_val)
+            shift = 1 if i > DOMAIN_INDEX else 0
+            return shift, str(stage_val).strip()
+
+    # Fallback: no encontramos la pregunta por nombre, pero llegan más
+    # respuestas de las esperadas -> asumimos layout nuevo para no
+    # desalinear las flags. Sin stage en el texto, pero veredicto correcto.
+    if len(questions) > COMMENTS_INDEX + 1:
+        logger.warning(
+            "Pregunta de stage no encontrada por nombre pero llegan "
+            f"{len(questions)} respuestas. Asumiendo layout nuevo sin stage."
+        )
+        return 1, ""
+
+    return 0, ""
 
 # ---FUNCIONES AUXILIARES---
 
@@ -102,20 +142,31 @@ async def find_entry_from_deal_id(deal_id: str, list_slug: str):
 
 def generar_payload(form_data, tier_actual="Tier 1"):
     questions = form_data.get("submission", {}).get("questions", [])
-    if len(questions) < COMMENTS_INDEX + 1:
+
+    shift, stage = detect_layout(questions)
+
+    flags_start = FLAGS_START + shift
+    flags_end = FLAGS_END + shift
+    multi_start = MULTI_FLAGS_START + shift
+    multi_end = MULTI_FLAGS_END + shift
+    comments_index = COMMENTS_INDEX + shift
+
+    if len(questions) < comments_index + 1:
         raise ValueError("Form data incompleto")
+
+    logger.info(f"DEBUG LAYOUT: shift={shift} | stage='{stage}' | n_questions={len(questions)}")
 
     reviewer = questions[REVIEWER_INDEX].get("value", "")
     domain = questions[DOMAIN_INDEX].get("value", "")
-    comments_raw = questions[COMMENTS_INDEX].get("value", "")
-    
+    comments_raw = questions[comments_index].get("value", "")
+
     # Extraemos las 7 preguntas base (P1 a P7)
     # P1: Thesis | P2-P4: Críticos | P5-P7: Complementarios
-    base_flags = [q.get("value", "") for q in questions[FLAGS_START:FLAGS_END]]
-    
+    base_flags = [q.get("value", "") for q in questions[flags_start:flags_end]]
+
     # Extraemos multi-flags (P8+) para el detalle visual
     multi_flags = []
-    for q in questions[MULTI_FLAGS_START:MULTI_FLAGS_END]:
+    for q in questions[multi_start:multi_end]:
         val = q.get("value")
         if isinstance(val, list): multi_flags.extend(val)
         elif val: multi_flags.append(val)
@@ -167,7 +218,9 @@ def generar_payload(form_data, tier_actual="Tier 1"):
         voto_icon = "❌"
     else:
         voto_icon = "➖"
-    payload = f"Reviewer: {reviewer} ({tier_actual})\n"
+
+    contexto = f"{tier_actual} · {stage}" if stage else tier_actual
+    payload = f"Reviewer: {reviewer} ({contexto})\n"
     payload += f"Veredicto: {voto_icon} {veredicto_nombre}\n"
     payload += "\n-- DETALLE --\n"
 
@@ -181,8 +234,8 @@ def generar_payload(form_data, tier_actual="Tier 1"):
         elif "🔴" in flag: red_txt += f"{flag}\n"
 
     comments = f"{reviewer}: {comments_raw}" if comments_raw else ""
-    
-    return domain, payload, green_txt, red_txt, comments, reviewer, veredicto_nombre, es_voto_ok
+
+    return domain, payload, green_txt, red_txt, comments, reviewer, veredicto_nombre, es_voto_ok, stage
 
 def calculate_funnel_status(tier_actual, t1_ok, t1_ko, t2_ok, t2_ko, default_status=None):
     if tier_actual == "Tier 2":
@@ -274,7 +327,8 @@ def parse_latest_verdict_per_reviewer(conviction_text: str) -> dict:
         if ":" not in line:
             continue
         reviewer, _, verdict = line.partition(":")
-        reviewer = reviewer.strip()
+        # El nombre puede venir como "Luiza (post-call, deck)" -> nos quedamos con "Luiza"
+        reviewer = reviewer.partition("(")[0].strip()
         verdict = verdict.strip()
         if reviewer and reviewer not in latest:
             latest[reviewer] = verdict
@@ -353,7 +407,7 @@ async def handle_signals(request: Request):
         status_list = entry_values.get("status", [])
         status_actual = status_list[0].get("status", {}).get("title") if status_list else "" 
 
-        _, payload, green_flags, red_flags, new_comment, reviewer, veredicto_nombre, es_voto_ok = generar_payload(form_data, tier_actual)
+        _, payload, green_flags, red_flags, new_comment, reviewer, veredicto_nombre, es_voto_ok, stage = generar_payload(form_data, tier_actual)
         
         await upload_reviewer_ko_ok(entry_id, es_voto_ok, reviewer, tier_actual, list_slug)
 
@@ -412,7 +466,7 @@ async def handle_signals(request: Request):
         if status == "In play" and not call_eval_assigned:
             await assign_call_evaluator(entry_id, list_slug)
 
-        new_conviction_line = f"{reviewer}: {veredicto_nombre}"
+        new_conviction_line = f"{reviewer} ({stage}): {veredicto_nombre}" if stage else f"{reviewer}: {veredicto_nombre}"
         ex_conviction_list = entry_values.get("screening_conviction", [])
         ex_conviction = ex_conviction_list[0].get("value", "") if ex_conviction_list else ""
 
